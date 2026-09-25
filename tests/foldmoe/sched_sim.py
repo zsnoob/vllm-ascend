@@ -210,10 +210,56 @@ def sched_async_underA(P, d, merge):
     return s
 
 
+def sched_async_keepD(P, d, merge):
+    """同时保住两件事：R_attn(k) 藏在 A(k+1) 底下，D(k) 仍压在计算底下。
+
+    关键是把 apost_d(k+1) 排在 acore(k+2) 之后、M(k) 之前：
+    A(k+2) 先盖住 R_attn(k+1)，随后发出的 D(k+1) 又被 M(k) 盖住，
+    而 M(k) 消费的 D(k) 是上一轮发的，早已在 A(k+1) 底下跑完。
+    """
+    s = Sim(merge)
+    s.issue("comp", "x.head", P["x_head"])
+    evd, evc, evr = [None] * d, [None] * d, [None] * d
+    pend = []
+
+    def acore(i):
+        s.issue("comp", "A%d" % i, P["A"][i])
+        evr[i] = s.issue("ar", "Ra%d" % i, P["Ra"][i])
+
+    def apost_d(i):
+        s.wait("comp", evr[i])
+        s.issue("ar", "G%d" % i, P["G"][i])
+        s.issue("comp", "x.pre%d" % i, P["x_pre"])
+        evd[i] = s.issue("comm", "D%d" % i, P["D"][i])
+
+    acore(0)
+    acore(1)
+    apost_d(0)
+    for k in range(d):
+        if k + 2 < d:
+            acore(k + 2)          # A(k+2) 盖住 R_attn(k+1)
+        if k + 1 < d:
+            apost_d(k + 1)        # 发 D(k+1)，随后被 M(k) 盖住
+        s.wait("comp", evd[k])
+        em = s.issue("comp", "M%d" % k, P["M"][k])
+        evc[k] = s.issue("comm", "C%d" % k, P["C"][k], waits=[em])
+        if k >= 1:
+            s.wait("comp", evc[k - 1])
+            s.issue("comp", "F%d" % (k - 1), P["x_post"])
+            pend.append(s.issue("ar", "Rm%d" % (k - 1), P["Rm"][k - 1]))
+    s.wait("comp", evc[d - 1])
+    s.issue("comp", "F%d" % (d - 1), P["x_post"])
+    pend.append(s.issue("ar", "Rm%d" % (d - 1), P["Rm"][d - 1]))
+    for e in pend:
+        s.wait("comp", e)
+    return s
+
+
 SCHEDS = [
     ("sync（当前 vLLM）", sched_sync),
     ("async·藏在M底下", sched_async_underM),
     ("async·藏在A底下", sched_async_underA),
+    ("async·A底下+保住D", sched_async_keepD),
 ]
 
 if __name__ == "__main__":
