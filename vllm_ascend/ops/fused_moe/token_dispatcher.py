@@ -475,6 +475,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
     def token_dispatch(
         self,
         token_dispatch_input: MoETokenDispatchInput,
+        _defer_state=None,
     ):
         use_mxfp_quant = token_dispatch_input.quant.is_mxfp
         with_quant = token_dispatch_input.quant.dispatch_with_quant
@@ -505,6 +506,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         ) = self._dispatch_preprocess(hidden_states, topk_ids)
 
         dynamic_scale_after_all2all = None
+        pend = {"handles": [], "free": []}
         if with_quant:
             permutated_local_input_tokens, dynamic_scale = DeviceOperator.npu_dynamic_quant(
                 permutated_local_input_tokens, act_quant_type=dst_type, use_mxfp_quant=use_mxfp_quant
@@ -512,14 +514,32 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             _, dynamic_scale_after_all2all, permute2_ep_all_to_all_handle = async_all_to_all(
                 dynamic_scale, output_splits, input_splits, self.ep_group
             )
-            permute2_ep_all_to_all_handle.wait()
-            dynamic_scale.untyped_storage().resize_(0)
+            pend["handles"].append(permute2_ep_all_to_all_handle)
+            pend["free"].append(dynamic_scale)
 
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
             permutated_local_input_tokens, output_splits, input_splits, self.ep_group
         )
-        permute1_ep_all_to_all_handle.wait()
-        permutated_local_input_tokens.untyped_storage().resize_(0)
+        pend["handles"].append(permute1_ep_all_to_all_handle)
+        pend["free"].append(permutated_local_input_tokens)
+
+        if _defer_state is not None:
+            # 延迟模式：把未完成的通信和后处理所需的一切打包返回，不阻塞
+            _defer_state.update(dict(
+                pend=pend, global_input_tokens=global_input_tokens,
+                dynamic_scale_after_all2all=dynamic_scale_after_all2all,
+                gilei=global_input_tokens_local_experts_indices, with_quant=with_quant,
+                dst_type=dst_type, scale_type=scale_type, tokens_per_expert=tokens_per_expert,
+                input_splits=input_splits, output_splits=output_splits, topk_weights=topk_weights,
+                rlipm=reversed_local_input_permutation_mapping,
+                hidden_shape=hidden_shape, hidden_shape_before_permute=hidden_shape_before_permute,
+            ))
+            return None
+
+        for _h in pend["handles"]:
+            _h.wait()
+        for _t in pend["free"]:
+            _t.untyped_storage().resize_(0)
 
         if self.lora_context is not None:
             all2all_lora_indices(
@@ -556,7 +576,30 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             ),
         )
 
-    def token_combine(self, hidden_states, combine_metadata, bias=None):
+    def token_dispatch_finish(self, st):
+        """延迟模式的第二段：等待通信完成 + 后处理"""
+        for h in st["pend"]["handles"]:
+            h.wait()
+        for t in st["pend"]["free"]:
+            t.untyped_storage().resize_(0)
+        git, ds_final, rgipm = self._dispatch_postprocess(
+            st["global_input_tokens"], st["dynamic_scale_after_all2all"], st["gilei"],
+            st["with_quant"], st["dst_type"], st["scale_type"],
+        )
+        return MoETokenDispatchOutput(
+            hidden_states=git, dynamic_scale=ds_final,
+            group_list=st["tokens_per_expert"], group_list_type=1,
+            combine_metadata=MoEAllToAllCombineMetadata(
+                input_splits=st["input_splits"], output_splits=st["output_splits"],
+                topk_weights=st["topk_weights"],
+                reversed_local_input_permutation_mapping=st["rlipm"],
+                reversed_global_input_permutation_mapping=rgipm,
+                hidden_shape=st["hidden_shape"],
+                hidden_shape_before_permute=st["hidden_shape_before_permute"],
+            ),
+        )
+
+    def token_combine(self, hidden_states, combine_metadata, bias=None, _defer_state=None):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
         # 1. Preprocess using metadata
@@ -569,6 +612,16 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             combine_metadata.output_splits,
             self.ep_group,
         )
+
+        if _defer_state is not None:
+            # 延迟模式：通信已发起但不等待，后处理留到 token_combine_finish
+            _defer_state.update(dict(
+                handle=handle, src=hidden_states,
+                permutated_local_input_tokens=permutated_local_input_tokens,
+                combine_metadata=combine_metadata,
+            ))
+            return None
+
         handle.wait()
         hidden_states.untyped_storage().resize_(0)
 
@@ -576,6 +629,72 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         output = self._combine_postprocess(permutated_local_input_tokens, combine_metadata)
 
         return output
+
+    def token_combine_finish(self, st):
+        """延迟模式第二段：等待 combine 通信完成 + 后处理"""
+        st["handle"].wait()
+        st["src"].untyped_storage().resize_(0)
+        return self._combine_postprocess(
+            st["permutated_local_input_tokens"], st["combine_metadata"]
+        )
+
+    # ---- prep / issue 三段式：preprocess 留在计算流，只把 a2a 发到通信流 ----
+    def token_dispatch_prep(self, token_dispatch_input):
+        tdi = token_dispatch_input
+        (perm, rlipm, tpe, isp, osp, gilei, hshape, hsbp) = self._dispatch_preprocess(
+            tdi.hidden_states, tdi.topk_ids
+        )
+        st = dict(perm=perm, rlipm=rlipm, tokens_per_expert=tpe, input_splits=isp,
+                  output_splits=osp, gilei=gilei, hidden_shape=hshape,
+                  hidden_shape_before_permute=hsbp, topk_weights=tdi.topk_weights,
+                  with_quant=tdi.quant.dispatch_with_quant, dst_type=tdi.quant.get_dst_type,
+                  scale_type=tdi.quant.get_scale_type, use_mxfp=tdi.quant.is_mxfp,
+                  dynamic_scale=None)
+        if st["with_quant"]:
+            st["perm"], st["dynamic_scale"] = DeviceOperator.npu_dynamic_quant(
+                st["perm"], act_quant_type=st["dst_type"], use_mxfp_quant=st["use_mxfp"]
+            )
+        return st
+
+    def token_dispatch_issue(self, st, _defer_state):
+        cs = torch.npu.current_stream()
+        pend = {"handles": [], "free": []}
+        ds_after = None
+        if st["with_quant"]:
+            st["dynamic_scale"].record_stream(cs)
+            _, ds_after, h = async_all_to_all(
+                st["dynamic_scale"], st["output_splits"], st["input_splits"], self.ep_group
+            )
+            pend["handles"].append(h)
+            pend["free"].append(st["dynamic_scale"])
+        st["perm"].record_stream(cs)
+        _, git, h1 = async_all_to_all(
+            st["perm"], st["output_splits"], st["input_splits"], self.ep_group
+        )
+        pend["handles"].append(h1)
+        pend["free"].append(st["perm"])
+        _defer_state.update(dict(
+            pend=pend, global_input_tokens=git, dynamic_scale_after_all2all=ds_after,
+            gilei=st["gilei"], with_quant=st["with_quant"], dst_type=st["dst_type"],
+            scale_type=st["scale_type"], tokens_per_expert=st["tokens_per_expert"],
+            input_splits=st["input_splits"], output_splits=st["output_splits"],
+            topk_weights=st["topk_weights"], rlipm=st["rlipm"],
+            hidden_shape=st["hidden_shape"],
+            hidden_shape_before_permute=st["hidden_shape_before_permute"],
+        ))
+
+    def token_combine_prep(self, hidden_states, combine_metadata):
+        return self._combine_preprocess(hidden_states, combine_metadata)
+
+    def token_combine_issue(self, hidden_states, combine_metadata, _defer_state):
+        hidden_states.record_stream(torch.npu.current_stream())
+        _, plit, handle = async_all_to_all(
+            hidden_states, combine_metadata.input_splits,
+            combine_metadata.output_splits, self.ep_group,
+        )
+        _defer_state.update(dict(handle=handle, src=hidden_states,
+                                 permutated_local_input_tokens=plit,
+                                 combine_metadata=combine_metadata))
 
     def _dispatch_preprocess(self, hidden_states, topk_ids):
         hidden_shape = hidden_states.shape

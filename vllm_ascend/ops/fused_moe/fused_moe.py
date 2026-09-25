@@ -453,3 +453,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 defer_output_wait=defer_shared_output_wait,
             )
             return shared_out, routed_out
+
+
+# --- FoldMoE 1A1M attention-MoE 流水线（仅 FOLDMOE_1A1M>1 时挂载）---
+import os as _os_foldmoe
+
+if int(_os_foldmoe.environ.get("FOLDMOE_1A1M", "0")) > 1:
+    try:
+        from vllm_ascend.ops.fused_moe import foldmoe_1a1m as _foldmoe
+
+        _foldmoe.apply()
+        logger.info("[foldmoe_1a1m] mounted d=%s", _os_foldmoe.environ["FOLDMOE_1A1M"])
+    except Exception as _e:  # 挂载失败时退回原始实现，不影响正常路径
+        logger.warning("[foldmoe_1a1m] mount failed: %s", _e)
