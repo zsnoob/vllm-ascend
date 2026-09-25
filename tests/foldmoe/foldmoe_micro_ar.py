@@ -86,11 +86,11 @@ def main():
     # o_proj 行并行切片：每卡吃自己那 8 个头，出来是部分和，要 all-reduce
     w_o = rnd(HEADS * DV, H)
     gw = torch.Generator().manual_seed(99 + rank)
-    # 权重布局必须和 vllm 的 unquant_apply_mlp 一致：按 [E, 出, 入] 存，调用前 transpose(1,2)。
-    # 直接按 [E, 入, 出] 连续存虽然形状相同，但 npu_grouped_matmul 会走慢路径——
-    # 实测同样的 FLOPs 慢 5.5 倍（39 TFLOPS vs 真实 vLLM 的 215 TFLOPS）。
-    w13 = (torch.randn(E_loc, 2 * INTER, H, generator=gw) * 0.02).to(bf).to(dev).transpose(1, 2)
-    w2 = (torch.randn(E_loc, H, INTER, generator=gw) * 0.02).to(bf).to(dev).transpose(1, 2)
+    # 布局与 vllm 的 process_weights_after_loading 一致：transpose 后 .contiguous()，
+    # 即连续的 [E, 入, 出]。（vllm 另有 npu_format_cast 到 FRACTAL_NZ，但只在
+    # enable_fused_mc2 时才做，我们跑的 alltoall 路径不走它。）
+    w13 = (torch.randn(E_loc, H, 2 * INTER, generator=gw) * 0.02).to(bf).to(dev).contiguous()
+    w2 = (torch.randn(E_loc, INTER, H, generator=gw) * 0.02).to(bf).to(dev).contiguous()
     mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(dev)
     logits = torch.randn(L, E, generator=g)
     topw, topi = logits.softmax(-1).topk(TOPK, dim=-1)
